@@ -1,0 +1,543 @@
+--[[
+  KeyGuardian Validator v2.0
+  Cloudflare Pages Backend Integration
+]]
+
+local Validator = {}
+
+-- Configuration
+local API_BASE = "https://keyguardian-backend.pages.dev/api" -- Cloudflare Pages domain
+local DEBUG_MODE = true -- Debug modu (true/false)
+local currentToken = nil
+local currentHWID = nil
+local loaderCallback = nil
+local currentDiscordInvite = nil
+
+-- Saved key dosya işlemleri ve rate limit (en üste taşındı)
+local KEY_SAVE_FILE = "Kanistay_keys.json"
+local RATE_LIMIT_WINDOW = 20 -- saniye
+local RATE_LIMIT_MAX = 4
+local validateTimestamps = {}
+
+-- Dosya fonksiyonları yoksa stub ekle (her ortamda güvenli çalışsın)
+if not isfile then function isfile() return false end end
+if not readfile then function readfile() return "" end end
+if not writefile then function writefile() end end
+if not delfile then function delfile() end end
+
+-- Zaman işleme fonksiyonları
+local function parseTimestamp(timestamp)
+    if type(timestamp) == "string" then
+        -- ISO string formatından Unix timestamp'e çevir
+        local year, month, day, hour, min, sec = timestamp:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+        if year then
+            local timeTable = {
+                year = tonumber(year),
+                month = tonumber(month),
+                day = tonumber(day),
+                hour = tonumber(hour),
+                min = tonumber(min),
+                sec = tonumber(sec)
+            }
+            return os.time(timeTable)
+        end
+    elseif type(timestamp) == "number" then
+        -- Eğer 13 haneli (milisaniye) ise saniyeye çevir
+        if timestamp > 1e12 then
+            return math.floor(timestamp / 1000)
+        else
+            return timestamp
+        end
+    end
+    return nil
+end
+
+local function getCurrentTimestamp()
+    return os.time()
+end
+
+local function isExpired(expiredAt)
+    if not expiredAt then return true end
+    
+    local currentTime = getCurrentTimestamp()
+    local expirationTime = parseTimestamp(expiredAt)
+    
+    if not expirationTime then
+        debug("Invalid expiration timestamp: " .. tostring(expiredAt))
+        return true
+    end
+    
+    debug("Current time: " .. currentTime .. ", Expiration time: " .. expirationTime .. ", Expired: " .. tostring(currentTime > expirationTime))
+    return currentTime > expirationTime
+end
+
+local function formatTimeRemaining(expiredAt)
+    if not expiredAt then return "Unknown" end
+    
+    local currentTime = getCurrentTimestamp()
+    local expirationTime = parseTimestamp(expiredAt)
+    
+    if not expirationTime then return "Invalid time" end
+    
+    local remaining = expirationTime - currentTime
+    if remaining <= 0 then
+        return "Expired"
+    elseif remaining < 60 then
+        return math.floor(remaining) .. " seconds"
+    elseif remaining < 3600 then
+        return math.floor(remaining / 60) .. " minutes"
+    elseif remaining < 86400 then
+        return math.floor(remaining / 3600) .. " hours"
+    else
+        return math.floor(remaining / 86400) .. " days"
+    end
+end
+
+-- Debug function
+debug = function(message, data)
+    if DEBUG_MODE then
+        warn("[KeyGuardian Debug] " .. tostring(message))
+        if data ~= nil then
+            if typeof(data) == "table" then
+                local ok, json = pcall(function()
+                    return game:GetService("HttpService"):JSONEncode(data)
+                end)
+                if ok then
+                    warn("[KeyGuardian Debug] Data: " .. json)
+                else
+                    warn("[KeyGuardian Debug] Data (table, encode error): " .. tostring(data))
+                end
+            else
+                warn("[KeyGuardian Debug] Data: " .. tostring(data))
+            end
+        end
+    end
+end
+
+-- Saved key functions (fonksiyon tanımları StartValidation'dan önce)
+local function saveKey(key, hwid, expires)
+    local data = {
+        key = key,
+        hwid = hwid,
+        expires = expires,
+        savedAt = getCurrentTimestamp()
+    }
+    local ok, json = pcall(function()
+        return game:GetService("HttpService"):JSONEncode(data)
+    end)
+    if ok then
+        writefile(KEY_SAVE_FILE, json)
+        debug("Saved key written", data)
+        debug("Key expires in: " .. formatTimeRemaining(expires))
+    else
+        debug("Failed to encode saved key", data)
+    end
+end
+
+local function getSavedKey()
+    if not isfile(KEY_SAVE_FILE) then return nil end
+    local ok, content = pcall(function()
+        return readfile(KEY_SAVE_FILE)
+    end)
+    if not ok or not content then
+        debug("Saved key file read error, deleting...")
+        pcall(function() delfile(KEY_SAVE_FILE) end)
+        return nil
+    end
+    local ok2, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(content)
+    end)
+    if not ok2 or type(data) ~= "table" or not data.key or not data.hwid or not data.expires then
+        debug("Saved key file corrupted or invalid, deleting...")
+        pcall(function() delfile(KEY_SAVE_FILE) end)
+        return nil
+    end
+    return data
+end
+
+local function removeSavedKey()
+    if isfile(KEY_SAVE_FILE) then
+        pcall(function() delfile(KEY_SAVE_FILE) end)
+        debug("Saved key file deleted")
+    end
+end
+
+-- Rate limit fonksiyonu
+local function canValidate()
+    local now = tick()
+    -- Eski timestamp'leri temizle
+    for i = #validateTimestamps, 1, -1 do
+        if now - validateTimestamps[i] > RATE_LIMIT_WINDOW then
+            table.remove(validateTimestamps, i)
+        end
+    end
+    if #validateTimestamps >= RATE_LIMIT_MAX then
+        local waitTime = math.ceil(RATE_LIMIT_WINDOW - (now - validateTimestamps[1]))
+        return false, waitTime
+    end
+    table.insert(validateTimestamps, now)
+    return true, 0
+end
+
+-- Get HWID from Roblox
+local function getHWID()
+    local success, hwid = pcall(function()
+        return game:GetService("RbxAnalyticsService"):GetClientId()
+    end)
+    
+    if success and hwid then
+        debug("HWID obtained: " .. tostring(hwid))
+        return tostring(hwid)
+    else
+        debug("Failed to get HWID, using fallback")
+        return "unknown_hwid_" .. tostring(tick())
+    end
+end
+
+-- Make HTTP request to backend
+local function makeRequest(endpoint, method, body)
+    local url = API_BASE .. endpoint
+    local options = {
+        Url = url,
+        Method = method or "GET",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["User-Agent"] = "KeyGuardian-Validator/2.0"
+        }
+    }
+    
+    if body then
+        options.Body = game:GetService("HttpService"):JSONEncode(body)
+    end
+    
+    debug("Making request", options)
+    local success, response = pcall(function()
+        return request(options)
+    end)
+    debug("Request result", response)
+    if not success then
+        debug("Request pcall failed", response)
+        return nil
+    end
+    if response and response.Body then
+        debug("Response.Body", response.Body)
+    end
+    if response and response.StatusCode then
+        debug("Response.StatusCode", response.StatusCode)
+    end
+    if response and response.StatusMessage then
+        debug("Response.StatusMessage", response.StatusMessage)
+    end
+    if response and response.Success ~= nil then
+        debug("Response.Success", response.Success)
+    end
+    if response and response.Body and (response.StatusCode == 200 or response.StatusCode == 201 or response.StatusCode == 404) then
+        local ok, decoded = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(response.Body)
+        end)
+        if ok and decoded then
+            debug("Decoded JSON", decoded)
+            return decoded -- success false olsa bile döndür
+        else
+            debug("JSON decode error or backend returned error", response.Body)
+            return nil
+        end
+    else
+        debug("Request failed", response)
+        return nil
+    end
+end
+
+-- Discord RPC join fonksiyonu
+local function joinDiscordInvite(inviteCode)
+    local HttpService = game:GetService("HttpService")
+    local payload = HttpService:JSONEncode({
+        cmd = "INVITE_BROWSER",
+        nonce = HttpService:GenerateGUID(false),
+        args = { code = inviteCode }
+    })
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Origin"] = "https://discord.com"
+    }
+    pcall(function()
+        if typeof(request) == "function" then
+            request({
+                Url = "http://127.0.0.1:6463/rpc?v=1",
+                Method = "POST",
+                Headers = headers,
+                Body = payload
+            })
+        end
+    end)
+    debug("Discord invite join attempted: " .. tostring(inviteCode))
+end
+
+-- Get token and discord invite from backend
+local function getTokenAndDiscord()
+    local result = makeRequest("/token")
+    if result and result.token and result.discordInvite then
+        debug("Token and Discord invite obtained from backend")
+        return result.token, result.discordInvite
+    else
+        debug("Failed to get token and Discord invite from backend")
+        return nil, nil
+    end
+end
+
+-- Check if HWID is banned
+local function checkBannedHWID(hwid)
+    local result = makeRequest("/banned-keys")
+    if result and result.data then
+        for _, bannedKey in ipairs(result.data) do
+            if bannedKey.hwid == hwid then
+                debug("HWID found in banned list")
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Check if HWID has premium access
+local function checkPremiumHWID(hwid)
+    local result = makeRequest("/premium-keys")
+    if result and result.data then
+        for _, premiumKey in ipairs(result.data) do
+            if premiumKey.hwid == hwid then
+                debug("Premium HWID found: " .. tostring(premiumKey.key))
+                return true, premiumKey
+            end
+        end
+    end
+    return false, nil
+end
+
+-- Validate key
+local function validateKey(key, hwid)
+    debug("Validating key: " .. tostring(key) .. " with HWID: " .. tostring(hwid))
+    local result = makeRequest("/validate-key", "POST", {
+        key = key,
+        hwid = hwid
+    })
+    
+    if result then
+        debug("Validation result: " .. tostring(result.success))
+        if result.message then
+            debug("Message: " .. tostring(result.message))
+        end
+        if result.expiredAt then
+            debug("ExpiredAt: " .. tostring(result.expiredAt) .. " (parsed: " .. tostring(parseTimestamp(result.expiredAt)) .. ")")
+            debug("Time remaining: " .. formatTimeRemaining(result.expiredAt))
+        end
+        return result
+    else
+        debug("Validation request failed")
+        return {
+            success = false,
+            message = "Network error",
+            type = "network_error"
+        }
+    end
+end
+
+-- Setup function (token validation)
+function Validator.Setup(token, loader)
+    debug("Setting up validator with token: " .. tostring(token))
+    
+    -- Store loader callback
+    loaderCallback = loader
+    
+    -- Get current HWID
+    currentHWID = getHWID()
+    
+    -- Get token and discord invite from backend
+    local backendToken, backendDiscord = getTokenAndDiscord()
+    if not backendToken then
+        debug("Failed to get token from backend")
+        return false
+    end
+    
+    currentToken = backendToken
+    currentDiscordInvite = backendDiscord
+    
+    -- Check if provided token matches backend token
+    if token ~= backendToken then
+        debug("Token mismatch: provided=" .. tostring(token) .. ", backend=" .. tostring(backendToken))
+        return false
+    end
+    
+    debug("Setup completed successfully")
+    -- Otomatik Discord join
+    if currentDiscordInvite and currentDiscordInvite ~= "YOK" then
+        joinDiscordInvite(currentDiscordInvite)
+    end
+    return true
+end
+
+-- Start validation process (token kontrolünden hemen sonra çağrılacak)
+function Validator.StartValidation()
+    debug("Starting validation process...")
+    if not currentHWID then
+        debug("No HWID available")
+        return
+    end
+    -- Saved key kontrolü
+    local saved = getSavedKey()
+    if saved then
+        if saved.hwid ~= currentHWID then
+            debug("Saved key HWID mismatch, deleting saved key")
+            removeSavedKey()
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Saved key HWID mismatch!", "error")
+            end
+            return
+        end
+        if isExpired(saved.expires) then
+            debug("Saved key expired, deleting saved key")
+            removeSavedKey()
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Saved key expired!", "error")
+            end
+            return
+        end
+        -- Her şey doğruysa validate oldu, loader çalıştır
+        debug("Saved key valid, user validated locally")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Saved Key Used - Expires in: " .. formatTimeRemaining(saved.expires), "success")
+        end
+        if _G.SystemUserValidated then
+            _G.SystemUserValidated(currentHWID, saved.key, "saved")
+        end
+        if loaderCallback then loaderCallback() end
+        return
+    end
+    -- Saved key yoksa veya geçersizse, normal akış devam
+    -- HWID ban/premium kontrolleri ve diğer işlemler burada devam edecek
+    if checkBannedHWID(currentHWID) then
+        debug("HWID is banned - validation failed")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Your HWID is banned from using this system.", "error")
+        end
+        return
+    end
+    local isPremium, premiumKey = checkPremiumHWID(currentHWID)
+    if isPremium then
+        if premiumKey and not isExpired(premiumKey.expiredAt) then
+            debug("Premium HWID found and valid - auto validation")
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Premium access detected! Expires in: " .. formatTimeRemaining(premiumKey.expiredAt), "success")
+            end
+            if _G.SystemUserValidated then
+                _G.SystemUserValidated(currentHWID, premiumKey.key, "premium")
+            end
+            if loaderCallback then loaderCallback() end
+            return
+        else
+            debug("Premium HWID found but expired")
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Your premium access has expired.", "warning")
+            end
+        end
+    end
+    debug("No saved key, no premium access - showing key input")
+    if _G.SystemShowKeyInput then
+        _G.SystemShowKeyInput()
+    end
+end
+
+-- ValidateKey fonksiyonunda başarılı doğrulamada yeni saved key kaydedilecek
+function Validator.ValidateKey(token, key, loader, isAuto, isSavedKey)
+    debug("Validating key: " .. (type(key) == "table" and tostring(key.key) or tostring(key)))
+    if not currentHWID then
+        debug("No HWID available for validation")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("HWID not available. Please restart.", "error")
+        end
+        return
+    end
+    -- Rate limit kontrolü (manuel denemelerde)
+    if not isAuto then
+        local allowed, waitTime = canValidate()
+        if not allowed then
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Please wait " .. waitTime .. "s before trying", "warning")
+            end
+            return
+        end
+    end
+    -- Validate key with backend
+    local result = validateKey(key, currentHWID)
+    if result then
+        debug("Key validation result", result)
+        if result.success then
+            debug("Key validation successful: " .. tostring(result.type))
+            -- Başarılı doğrulamada saved key kaydet
+            local expires = result.expiredAt or (result.keyType == "premium" and (os.time() + 86400)) or (os.time() + 86400)
+            local parsedExpires = parseTimestamp(expires)
+            if parsedExpires then
+                expires = parsedExpires
+            end
+            saveKey(key, currentHWID, expires)
+            if isSavedKey then
+                if _G.SystemReceiveMessage then
+                    _G.SystemReceiveMessage("Saved Key Used - Expires in: " .. formatTimeRemaining(expires), "success")
+                end
+            else
+                if _G.SystemReceiveMessage then
+                    _G.SystemReceiveMessage("Key validated successfully! Expires in: " .. formatTimeRemaining(expires) .. " - Loading system...", "success")
+                end
+            end
+            if _G.SystemUserValidated then
+                _G.SystemUserValidated(currentHWID, key, result.type)
+            end
+            if loader then loader() end
+            return true
+        else
+            debug("Key validation failed: " .. tostring(result.message or "Unknown error"))
+            removeSavedKey()
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage(result.message or "Unknown error", "error")
+            end
+            if _G.SystemShowKeyInput then
+                _G.SystemShowKeyInput()
+            end
+        end
+    else
+        debug("Validation request failed")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Network error", "error")
+        end
+    end
+end
+
+-- Enable/disable debug mode
+function Validator.SetDebug(enabled)
+    DEBUG_MODE = enabled
+    debug("Debug mode " .. (enabled and "enabled" or "disabled"))
+end
+
+-- Get current status
+function Validator.GetStatus()
+    return {
+        token = currentToken,
+        hwid = currentHWID,
+        debug = DEBUG_MODE
+    }
+end
+
+-- Health check
+function Validator.HealthCheck()
+    debug("Performing health check...")
+    local result = makeRequest("/health")
+    
+    if result and result.success then
+        debug("Health check passed")
+        return true
+    else
+        debug("Health check failed")
+        return false
+    end
+end
+
+return Validator
