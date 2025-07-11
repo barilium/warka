@@ -1,0 +1,552 @@
+--[[
+  KeyGuardian Validator v2.0
+  Cloudflare Pages Backend Integration
+]]
+
+local Validator = {}
+
+-- Configuration
+local API_BASE = "https://keyguardian-backend.pages.dev/api" -- Cloudflare Pages domain
+local DEBUG_MODE = true -- Debug modu (true/false)
+local currentToken = nil
+local currentHWID = nil
+local loaderCallback = nil
+local currentDiscordInvite = nil
+
+-- Debug function
+debug = function(message, data)
+    if DEBUG_MODE then
+        warn("[KeyGuardian Debug] " .. tostring(message))
+        if data ~= nil then
+            if typeof(data) == "table" then
+                local ok, json = pcall(function()
+                    return game:GetService("HttpService"):JSONEncode(data)
+                end)
+                if ok then
+                    warn("[KeyGuardian Debug] Data: " .. json)
+                else
+                    warn("[KeyGuardian Debug] Data (table, encode error): " .. tostring(data))
+                end
+            else
+                warn("[KeyGuardian Debug] Data: " .. tostring(data))
+            end
+        end
+    end
+end
+
+-- Get HWID from Roblox
+local function getHWID()
+    local success, hwid = pcall(function()
+        return game:GetService("RbxAnalyticsService"):GetClientId()
+    end)
+    
+    if success and hwid then
+        debug("HWID obtained: " .. tostring(hwid))
+        return tostring(hwid)
+    else
+        debug("Failed to get HWID, using fallback")
+        return "unknown_hwid_" .. tostring(tick())
+    end
+end
+
+-- Make HTTP request to backend
+local function makeRequest(endpoint, method, body)
+    local url = API_BASE .. endpoint
+    local options = {
+        Url = url,
+        Method = method or "GET",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["User-Agent"] = "KeyGuardian-Validator/2.0"
+        }
+    }
+    
+    if body then
+        options.Body = game:GetService("HttpService"):JSONEncode(body)
+    end
+    
+    debug("Making request", options)
+    local success, response = pcall(function()
+        return request(options)
+    end)
+    debug("Request result", response)
+    if not success then
+        debug("Request pcall failed", response)
+        return nil
+    end
+    if response and response.Body then
+        debug("Response.Body", response.Body)
+    end
+    if response and response.StatusCode then
+        debug("Response.StatusCode", response.StatusCode)
+    end
+    if response and response.StatusMessage then
+        debug("Response.StatusMessage", response.StatusMessage)
+    end
+    if response and response.Success ~= nil then
+        debug("Response.Success", response.Success)
+    end
+    if response and response.Body and (response.StatusCode == 200 or response.StatusCode == 201 or response.StatusCode == 404) then
+        local ok, decoded = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(response.Body)
+        end)
+        if ok and decoded then
+            debug("Decoded JSON", decoded)
+            return decoded -- success false olsa bile döndür
+        else
+            debug("JSON decode error or backend returned error", response.Body)
+            return nil
+        end
+    else
+        debug("Request failed", response)
+        return nil
+    end
+end
+
+-- Discord RPC join fonksiyonu
+local function joinDiscordInvite(inviteCode)
+    local HttpService = game:GetService("HttpService")
+    local payload = HttpService:JSONEncode({
+        cmd = "INVITE_BROWSER",
+        nonce = HttpService:GenerateGUID(false),
+        args = { code = inviteCode }
+    })
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Origin"] = "https://discord.com"
+    }
+    pcall(function()
+        if typeof(request) == "function" then
+            request({
+                Url = "http://127.0.0.1:6463/rpc?v=1",
+                Method = "POST",
+                Headers = headers,
+                Body = payload
+            })
+        else
+            HttpService:PostAsync("http://127.0.0.1:6463/rpc?v=1", payload, Enum.HttpContentType.ApplicationJson, false, headers)
+        end
+    end)
+end
+
+-- Get token and discord invite from backend
+local function getTokenAndDiscord()
+    debug("Getting token and discord invite from backend...")
+    local result = makeRequest("/token")
+    if result and result.success then
+        debug("Token/Discord validation successful", result)
+        return result.token, result.discord_invite
+    else
+        debug("Token/Discord validation failed", result)
+        return nil, nil
+    end
+end
+
+-- Check if HWID is in premium keys
+local function checkPremiumHWID(hwid)
+    debug("Checking premium HWID: " .. hwid)
+    local result = makeRequest("/check-premium-hwid", "POST", {
+        hwid = hwid
+    })
+    
+    if result and result.success and result.found then
+        debug("HWID found in premium keys")
+        return true, result.key
+    else
+        debug("HWID not found in premium keys")
+        return false, nil
+    end
+end
+
+-- Check if HWID is banned
+local function checkBannedHWID(hwid)
+    debug("Checking banned HWID: " .. hwid)
+    local result = makeRequest("/banned-keys")
+    
+    if result and result.success and result.data then
+        for _, bannedKey in pairs(result.data) do
+            if bannedKey.hwid == hwid then
+                debug("HWID found in banned list")
+                return true
+            end
+        end
+    end
+    
+    debug("HWID not found in banned list")
+    return false
+end
+
+-- Validate key
+local function validateKey(key, hwid)
+    debug("Validating key: " .. (type(key) == "table" and tostring(key.key) or tostring(key)) .. " with HWID: " .. tostring(hwid))
+    local result = makeRequest("/validate-key", "POST", {
+        key = key,
+        hwid = hwid
+    })
+    
+    if result then
+        debug("Validation result: " .. tostring(result.success))
+        if result.message then
+            debug("Message: " .. result.message)
+        end
+        return result
+    else
+        debug("Validation request failed")
+        return {
+            success = false,
+            message = "Network error",
+            type = "network_error"
+        }
+    end
+end
+
+-- Setup function (token validation)
+function Validator.Setup(token, loader)
+    debug("Setting up validator with token: " .. tostring(token))
+    
+    -- Store loader callback
+    loaderCallback = loader
+    
+    -- Get current HWID
+    currentHWID = getHWID()
+    
+    -- Get token and discord invite from backend
+    local backendToken, backendDiscord = getTokenAndDiscord()
+    if not backendToken then
+        debug("Failed to get token from backend")
+        return false
+    end
+    
+    currentToken = backendToken
+    currentDiscordInvite = backendDiscord
+    
+    -- Check if provided token matches backend token
+    if token ~= backendToken then
+        debug("Token mismatch: provided=" .. tostring(token) .. ", backend=" .. tostring(backendToken))
+        return false
+    end
+    
+    debug("Setup completed successfully")
+    -- Otomatik Discord join
+    if currentDiscordInvite and currentDiscordInvite ~= "YOK" then
+        joinDiscordInvite(currentDiscordInvite)
+    end
+    return true
+end
+
+-- Discord join fonksiyonunu dışarı aç
+-- function Validator.JoinDiscord()
+--     if currentDiscordInvite and currentDiscordInvite ~= "YOK" then
+--         joinDiscordInvite(currentDiscordInvite)
+--     end
+-- end
+
+-- Start validation process
+function Validator.StartValidation()
+    debug("Starting validation process...")
+    
+    if not currentHWID then
+        debug("No HWID available")
+        return
+    end
+    
+    -- Önce kayıtlı key kontrolü (request atmadan)
+    local saved = nil
+    if type(getSavedKey) == "function" then
+        saved = getSavedKey()
+    end
+    if saved then
+        if saved.hwid ~= currentHWID then
+            print("[Validator] Saved key HWID uyuşmuyor!")
+            removeKey(saved.key)
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Saved key HWID mismatch!", "error")
+            end
+            return
+        end
+        if saved.expires and os.time() > saved.expires then
+            print("[Validator] Saved key süresi dolmuş!")
+            removeKey(saved.key)
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Saved key expired!", "error")
+            end
+            return
+        end
+        -- Şartlar sağlanıyorsa validate
+        print("[Validator] Saved key ile otomatik giriş yapıldı!")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Saved Key Used", "success")
+        end
+        if _G.SystemUserValidated then
+            _G.SystemUserValidated(currentHWID, saved.key, "saved")
+        end
+        if loaderCallback then loaderCallback() end
+        return
+    end
+    -- HWID ban/premium kontrolleri saved key'den sonra
+    if checkBannedHWID(currentHWID) then
+        debug("HWID is banned - validation failed")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Your HWID is banned from using this system.", "error")
+        end
+        return
+    end
+    local isPremium, premiumKey = checkPremiumHWID(currentHWID)
+    if isPremium then
+        if premiumKey and not premiumKey.expired then
+            debug("Premium HWID found and valid - auto validation")
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Premium access detected! Loading system...", "success")
+            end
+            if _G.SystemUserValidated then
+                _G.SystemUserValidated(currentHWID, premiumKey.key, "premium")
+            end
+            if loaderCallback then loaderCallback() end
+            return
+        else
+            debug("Premium HWID found but expired")
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Your premium access has expired.", "warning")
+            end
+        end
+    end
+    Validator.TrySavedKey(currentToken, loaderCallback)
+    debug("No premium access - showing key input and trying saved key")
+    if _G.SystemShowKeyInput then
+        _G.SystemShowKeyInput()
+    end
+end
+
+local KEY_SAVE_FILE = "Kanistay_keys.json"
+local RATE_LIMIT_WINDOW = 20 -- saniye
+local RATE_LIMIT_MAX = 4
+local validateTimestamps = {}
+
+-- Key saver fonksiyonları
+local function saveKeyWithMeta(key, hwid, expires)
+    local keys = {}
+    if isfile(KEY_SAVE_FILE) then
+        local ok, data = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(readfile(KEY_SAVE_FILE))
+        end)
+        if ok and type(data) == "table" then
+            keys = data
+        end
+    end
+    -- Aynı key ve hwid varsa güncelle, yoksa ekle
+    local found = false
+    for i, v in ipairs(keys) do
+        if v.key == key and v.hwid == hwid then
+            v.expires = expires
+            found = true
+            break
+        end
+    end
+    if not found then
+        table.insert(keys, {key=key, hwid=hwid, expires=expires})
+    end
+    writefile(KEY_SAVE_FILE, game:GetService("HttpService"):JSONEncode(keys))
+    debug("Key saved to Kanistay_keys.json", {key=key, hwid=hwid, expires=expires})
+end
+
+local function removeKey(key)
+    if not isfile(KEY_SAVE_FILE) then return end
+    local ok, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(readfile(KEY_SAVE_FILE))
+    end)
+    if ok and type(data) == "table" then
+        local keys = data
+        for i, v in ipairs(keys) do
+            -- Hem eski format (string) hem yeni format (table) için kontrol
+            if (type(v) == "string" and v == key) or (type(v) == "table" and v.key == key) then
+                table.remove(keys, i)
+                break
+            end
+        end
+        writefile(KEY_SAVE_FILE, game:GetService("HttpService"):JSONEncode(keys))
+        debug("Key removed from Kanistay_keys.json", key)
+    end
+end
+
+local function getSavedKey()
+    if not isfile(KEY_SAVE_FILE) then 
+        debug("Key save file not found")
+        return nil 
+    end
+    
+    local ok, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(readfile(KEY_SAVE_FILE))
+    end)
+    
+    if not ok then
+        debug("Key save file corrupted, deleting...")
+        delfile(KEY_SAVE_FILE)
+        return nil
+    end
+    
+    if not data or type(data) ~= "table" or #data == 0 then
+        debug("Key save file empty or invalid format")
+        return nil
+    end
+    
+    local savedKey = data[1]
+    if not savedKey then
+        debug("No saved key found")
+        return nil
+    end
+    
+    -- Eski format kontrolü (sadece string key)
+    if type(savedKey) == "string" then
+        debug("Old format detected, converting...")
+        -- Eski formatı yeni formata çevir
+        local newKey = {
+            key = savedKey,
+            hwid = currentHWID or "unknown",
+            expires = os.time() + 86400 -- 24 saat
+        }
+        -- Dosyayı güncelle
+        writefile(KEY_SAVE_FILE, game:GetService("HttpService"):JSONEncode({newKey}))
+        return newKey
+    end
+    
+    -- Yeni format kontrolü
+    if type(savedKey) == "table" and savedKey.key and savedKey.hwid and savedKey.expires then
+        return savedKey
+    else
+        debug("Invalid key format, deleting corrupted file...")
+        delfile(KEY_SAVE_FILE)
+        return nil
+    end
+end
+
+-- Rate limit fonksiyonu
+local function canValidate()
+    local now = tick()
+    -- Eski timestamp'leri temizle
+    for i = #validateTimestamps, 1, -1 do
+        if now - validateTimestamps[i] > RATE_LIMIT_WINDOW then
+            table.remove(validateTimestamps, i)
+        end
+    end
+    if #validateTimestamps >= RATE_LIMIT_MAX then
+        local waitTime = math.ceil(RATE_LIMIT_WINDOW - (now - validateTimestamps[1]))
+        return false, waitTime
+    end
+    table.insert(validateTimestamps, now)
+    return true, 0
+end
+
+-- Dinleme modunda saved key otomatik denensin
+function Validator.TrySavedKey(token, loader)
+    local savedKey = getSavedKey()
+    if savedKey then
+        debug("Trying saved key in listen mode", savedKey)
+        -- validate fonksiyonuna özel bir callback ile mesajı özelleştir
+        Validator.ValidateKey(token, savedKey, function()
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Saved Key Used", "success")
+            end
+            if loader then loader() end
+        end, true, true) -- isAuto, isSavedKey
+        return true
+    end
+    return false
+end
+
+-- Validate key function (güncellendi)
+function Validator.ValidateKey(token, key, loader, isAuto, isSavedKey)
+    debug("Validating key: " .. (type(key) == "table" and tostring(key.key) or tostring(key)))
+    if not currentHWID then
+        debug("No HWID available for validation")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("HWID not available. Please restart.", "error")
+        end
+        return
+    end
+    -- Rate limit kontrolü (manuel denemelerde)
+    if not isAuto then
+        local allowed, waitTime = canValidate()
+        if not allowed then
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Please wait " .. waitTime .. "s before trying", "warning")
+            end
+            return
+        end
+    end
+    -- Validate key with backend
+    local result = validateKey(key, currentHWID)
+    if result then
+        debug("Key validation result", result)
+        if result.success then
+            debug("Key validation successful: " .. result.type)
+            -- Hem normal hem premium key kaydedilecek
+            local expires = result.expires or (result.keyType == "premium" and (result.expiredAt or os.time() + 86400)) or (os.time() + 86400)
+            saveKeyWithMeta(key, currentHWID, expires)
+            if isSavedKey then
+                if _G.SystemReceiveMessage then
+                    _G.SystemReceiveMessage("Saved Key Used", "success")
+                end
+            else
+                if _G.SystemReceiveMessage then
+                    _G.SystemReceiveMessage("Key validated successfully! Loading system...", "success")
+                end
+            end
+            if _G.SystemUserValidated then
+                _G.SystemUserValidated(currentHWID, key, result.type)
+            end
+            if loader then loader() end
+            return true
+        else
+            debug("Key validation failed: " .. (result.message or "Unknown error"))
+            removeKey(key)
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage(result.message or "Unknown error", "error")
+            end
+            if _G.SystemShowKeyInput then
+                _G.SystemShowKeyInput()
+            end
+        end
+    else
+        debug("Validation request failed")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Network error", "error")
+        end
+    end
+end
+
+-- Enable/disable debug mode
+function Validator.SetDebug(enabled)
+    DEBUG_MODE = enabled
+    debug("Debug mode " .. (enabled and "enabled" or "disabled"))
+end
+
+-- Get current status
+function Validator.GetStatus()
+    return {
+        token = currentToken,
+        hwid = currentHWID,
+        debug = DEBUG_MODE
+    }
+end
+
+-- Health check
+function Validator.HealthCheck()
+    debug("Performing health check...")
+    local result = makeRequest("/health")
+    
+    if result and result.success then
+        debug("Health check passed")
+        return true
+    else
+        debug("Health check failed")
+        return false
+    end
+end
+
+-- Dosya fonksiyonları yoksa stub ekle (Roblox dışında güvenlik için)
+if not isfile then function isfile() return false end end
+if not readfile then function readfile() return "" end end
+if not writefile then function writefile() end end
+if not delfile then function delfile() end end
+
+return Validator
